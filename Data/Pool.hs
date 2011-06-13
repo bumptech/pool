@@ -195,13 +195,16 @@ modError :: String -> String -> a
 modError func msg =
     error $ "Data.Pool." ++ func ++ ": " ++ msg
 
+-- | Returns very general statistics about a 'Pool'.
+--
+-- * Specifically, a tuple containing:
+--   1) The total number of connections that all the sub-pools have open
+--   2) The total number of the connections that are idle
 stats :: Pool a -> IO (Int, Int)
 stats pool = do
   foldM localStats (0, 0) (V.toList $ localPools pool)
-  --return $ foldl addTuple (0, 0) s
   where
     localStats (a, b) local = atomically $ do
       inuse <- readTVar $ inUse local
       total <- readTVar $ entries local
       return (a + inuse, b + length total)
-    --addTuple (a, b) (c, d) = (a + c, b + d)
