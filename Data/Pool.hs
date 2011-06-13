@@ -23,13 +23,14 @@ module Data.Pool
       Pool(idleTime, maxResources, numStripes)
     , createPool
     , withResource
+    , stats
     ) where
 
 import Control.Applicative ((<$>))
 import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, catch)
-import Control.Monad (forM_, forever, join, liftM2, unless, when)
+import Control.Monad (forM_, forever, join, foldM, liftM2, unless, when)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.CatchIO (MonadCatchIO, onException)
 import Data.Hashable (hash)
@@ -193,3 +194,14 @@ modifyTVar_ v f = readTVar v >>= \a -> writeTVar v $! f a
 modError :: String -> String -> a
 modError func msg =
     error $ "Data.Pool." ++ func ++ ": " ++ msg
+
+stats :: Pool a -> IO (Int, Int)
+stats pool = do
+  foldM localStats (0, 0) (V.toList $ localPools pool)
+  --return $ foldl addTuple (0, 0) s
+  where
+    localStats (a, b) local = atomically $ do
+      inuse <- readTVar $ inUse local
+      total <- readTVar $ entries local
+      return (a + inuse, b + length total)
+    --addTuple (a, b) (c, d) = (a + c, b + d)
