@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ScopedTypeVariables, OverloadedStrings #-}
 
 #if MIN_VERSION_monad_control(0,3,0)
 {-# LANGUAGE FlexibleContexts #-}
@@ -31,6 +31,7 @@ module Data.Pool
       Pool(idleTime, maxResources, numStripes)
     , LocalPool
     , createPool
+    , createPool'
     , withResource
     , takeResource
     , destroyResource
@@ -40,11 +41,21 @@ module Data.Pool
 import Control.Applicative ((<$>))
 import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
+import Control.Concurrent.STM.Stats (getSTMStats, trackNamedSTM)
 import Control.Exception (SomeException, onException)
 import Control.Monad (forM_, forever, join, liftM2, unless, when)
+
+import qualified Data.Map as M
+import Data.Monoid (mappend)
 import Data.Hashable (hash)
 import Data.List (partition)
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
+import Data.Text.Format
+import Data.Text.Format.Params
+import Data.Text.Lazy.Builder (toLazyText, singleton)
+import qualified Data.Text.Lazy.IO as TIO
+
+import System.IO (stderr)
 import System.Mem.Weak (addFinalizer)
 import qualified Control.Exception as E
 import qualified Data.Vector as V
@@ -112,7 +123,11 @@ instance Show (Pool a) where
                     "idleTime = " ++ show idleTime ++ ", " ++
                     "maxResources = " ++ show maxResources ++ "}"
 
-createPool
+createPool :: IO a -> (a -> IO ()) -> Int -> NominalDiffTime -> Int -> IO (Pool a)
+createPool create destroy numStripes idleTime maxResources =
+  createPool' create destroy numStripes idleTime 0 maxResources
+
+createPool'
     :: IO a
     -- ^ Action that creates a new resource.
     -> (a -> IO ())
@@ -128,6 +143,9 @@ createPool
     -- longer than requested, as the reaper thread wakes at 1-second
     -- intervals.
     -> Int
+    -- ^ Amount of seconds to delay broadcasting stats.  A value of zero
+    -- will turn off stats.
+    -> Int
     -- ^ Maximum number of resources to keep open per stripe.  The
     -- smallest acceptable value is 1.
     --
@@ -135,13 +153,15 @@ createPool
     -- single stripe, even if other stripes have idle resources
     -- available.
      -> IO (Pool a)
-createPool create destroy numStripes idleTime maxResources = do
+createPool' create destroy numStripes idleTime trackTime maxResources = do
   when (numStripes < 1) $
     modError "pool " $ "invalid stripe count " ++ show numStripes
   when (idleTime < 0.5) $
     modError "pool " $ "invalid idle time " ++ show idleTime
   when (maxResources < 1) $
     modError "pool " $ "invalid maximum resource count " ++ show maxResources
+  when (trackTime < 0) $
+    modError "pool" $ "invalid stats tracking frequency " ++ show trackTime
   localPools <- atomically . V.replicateM numStripes $
                 liftM2 LocalPool (newTVar 0) (newTVar [])
   reaperId <- forkIO $ reaper destroy idleTime localPools
@@ -153,8 +173,49 @@ createPool create destroy numStripes idleTime maxResources = do
           , maxResources
           , localPools
           }
+  when (trackTime > 0) $ do
+    trackerId <- forkIO $ tracker localPools trackTime
+    addFinalizer p $ killThread trackerId
+
   addFinalizer p $ killThread reaperId
   return p
+
+-- | Periodically broadcast resource and STM stats. Frequency in seconds.
+tracker :: V.Vector (LocalPool a) -> Int -> IO ()
+tracker pools frequency = do
+    start <- getCurrentTime
+    track start 0
+  where
+    track start lastRetries = do
+        threadDelay (frequency * 1000000)
+        retries <- statRetriesToCommits "takeResource"
+        now <- getCurrentTime
+        V.forM_ pools $ \LocalPool{..} -> do
+            (inuse, idle) <- atomically $ do
+                inuse' <- readTVar inUse
+                entries' <- readTVar entries
+                return (inuse', length entries')
+            logger now "Data.Pool kept-alive={}, idle={}" (Shown inuse, Shown idle)
+        let diff = timeSince now start
+        let currentRetries = retries - lastRetries
+        logger now "Data.Pool retries/sec={}" (Only $ Shown (fromIntegral currentRetries / diff))
+        track now retries -- strict because of logger
+
+logger :: (Params ps) => UTCTime -> Format -> ps -> IO ()
+logger now f p = do
+  let pfx = build "[{}]: " (Only $ Shown now)
+  let user = build f p
+  TIO.hPutStr stderr $ toLazyText (pfx `mappend` (user `mappend` singleton '\n'))
+
+timeSince :: UTCTime -> UTCTime -> Double
+timeSince now start = realToFrac (now `diffUTCTime` start)
+
+statRetriesToCommits :: String -> IO Int
+statRetriesToCommits name = do
+  smap <- getSTMStats
+  case M.lookup name smap of
+    Just (_, retries) -> return retries
+    Nothing -> return 0
 
 -- | Periodically go through all pools, closing any resources that
 -- have been left idle for too long.
@@ -221,7 +282,7 @@ takeResource :: Pool a -> IO (a, LocalPool a)
 takeResource Pool{..} = do
   i <- liftBase $ ((`mod` numStripes) . hash) <$> myThreadId
   let pool@LocalPool{..} = localPools V.! i
-  resource <- liftBase . join . atomically $ do
+  resource <- liftBase . join . trackNamedSTM "takeResource" $ do
     ents <- readTVar entries
     case ents of
       (Entry{..}:es) -> writeTVar entries es >> return (return entry)
@@ -261,17 +322,3 @@ modifyTVar_ v f = readTVar v >>= \a -> writeTVar v $! f a
 modError :: String -> String -> a
 modError func msg =
     error $ "Data.Pool." ++ func ++ ": " ++ msg
-
--- | Returns very general statistics about a 'Pool'.
---
--- * Specifically, a tuple containing:
---   1) The total number of connections that all the sub-pools have open
---   2) The total number of the connections that are idle
-stats :: Pool a -> IO (Int, Int)
-stats pool = do
-  foldM localStats (0, 0) (V.toList $ localPools pool)
-  where
-    localStats (a, b) local = atomically $ do
-      inuse <- readTVar $ inUse local
-      total <- readTVar $ entries local
-      return (a + inuse, b + length total)
