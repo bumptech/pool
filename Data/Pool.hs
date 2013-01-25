@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ScopedTypeVariables, OverloadedStrings #-}
+{-# LANGUAGE CPP, NamedFieldPuns, RecordWildCards, ScopedTypeVariables, BangPatterns #-}
 
 #if MIN_VERSION_monad_control(0,3,0)
 {-# LANGUAGE FlexibleContexts #-}
@@ -46,16 +46,13 @@ import Control.Exception (SomeException, onException)
 import Control.Monad (forM_, forever, join, liftM2, unless, when)
 
 import qualified Data.Map as M
-import Data.Monoid (mappend)
 import Data.Hashable (hash)
 import Data.List (partition)
 import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime, getCurrentTime)
-import Data.Text.Format
-import Data.Text.Format.Params
-import Data.Text.Lazy.Builder (toLazyText, singleton)
-import qualified Data.Text.Lazy.IO as TIO
+import Data.Time.Format (formatTime)
 
-import System.IO (stderr)
+import System.Locale (defaultTimeLocale)
+import System.IO (hPutStrLn, stderr)
 import System.Mem.Weak (addFinalizer)
 import qualified Control.Exception as E
 import qualified Data.Vector as V
@@ -186,26 +183,27 @@ tracker pools frequency = do
     start <- getCurrentTime
     track start 0
   where
-    track start lastRetries = do
+    track !start !lastRetries = do
         threadDelay (frequency * 1000000)
         retries <- statRetriesToCommits "takeResource"
         now <- getCurrentTime
         V.forM_ pools $ \LocalPool{..} -> do
-            (inuse, idle) <- atomically $ do
+            (inuse, idle) <- trackNamedSTM "tracker" $ do
                 inuse' <- readTVar inUse
                 entries' <- readTVar entries
                 return (inuse', length entries')
-            logger now "Data.Pool kept-alive={}, idle={}" (Shown inuse, Shown idle)
+            logger now $ "Data.Pool {kept-alive=" ++ (show inuse) ++ ", idle=" ++ (show idle) ++ "}"
         let diff = timeSince now start
         let currentRetries = retries - lastRetries
-        logger now "Data.Pool retries/sec={}" (Only $ Shown (fromIntegral currentRetries / diff))
+        logger now $  "Data.Pool {retries/sec=" ++ (show $ fromIntegral currentRetries / diff) ++ "}"
         track now retries -- strict because of logger
 
-logger :: (Params ps) => UTCTime -> Format -> ps -> IO ()
-logger now f p = do
-  let pfx = build "[{}]: " (Only $ Shown now)
-  let user = build f p
-  TIO.hPutStr stderr $ toLazyText (pfx `mappend` (user `mappend` singleton '\n'))
+logger :: UTCTime -> String -> IO ()
+logger tm s = do
+    let d = formatTime defaultTimeLocale standardFormat $ tm
+    hPutStrLn stderr $ "[" ++ d ++ "] " ++ s
+  where
+    standardFormat = "%Y/%m/%d %H:%M:%S"
 
 timeSince :: UTCTime -> UTCTime -> Double
 timeSince now start = realToFrac (now `diffUTCTime` start)
