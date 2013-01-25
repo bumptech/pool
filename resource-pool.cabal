@@ -1,16 +1,16 @@
 name:                resource-pool
-version:             0.1.0.2
+version:             0.2.1.1
 synopsis:            A high-performance striped resource pooling implementation
 description:
   A high-performance striped pooling abstraction for managing
   flexibly-sized collections of resources such as database
   connections.
 
-homepage:            http://github.com/mailrank/pool
+homepage:            http://github.com/bos/pool
 license:             BSD3
 license-file:        LICENSE
-author:              Bryan O'Sullivan <bos@mailrank.com>
-maintainer:          Bryan O'Sullivan <bos@mailrank.com>
+author:              Bryan O'Sullivan <bos@serpentine.com>
+maintainer:          Bryan O'Sullivan <bos@serpentine.com>
 copyright:           Copyright 2011 MailRank, Inc.
 category:            Data, Database, Network
 build-type:          Simple
@@ -30,8 +30,9 @@ library
   build-depends:       
     base == 4.*,
     hashable,
-    MonadCatchIO-transformers,
+    monad-control >= 0.2.0.1,
     transformers,
+    transformers-base >= 0.4,
     stm,
     time,
     vector >= 0.7
@@ -45,7 +46,7 @@ library
 
 source-repository head
   type:     git
-  location: http://github.com/mailrank/pool
+  location: http://github.com/bos/pool
 
 source-repository head
   type:     mercurial
