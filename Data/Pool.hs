@@ -251,20 +251,23 @@ reaper destroy idleTime pools = forever $ do
 -- destroy a pooled resource, as doing so will almost certainly cause
 -- a subsequent user (who expects the resource to be valid) to throw
 -- an exception.
-withResource ::
-#if MIN_VERSION_monad_control(0,3,0)
-    (MonadBaseControl IO m)
-#else
-    (MonadControlIO m)
-#endif
-  => Pool a -> (a -> m b) -> m b
-{-# SPECIALIZE withResource :: Pool a -> (a -> IO b) -> IO b #-}
-withResource pool act = control $ \runInIO -> mask $ \restore -> do
-  (resource, local) <- takeResource pool
-  ret <- restore (runInIO (act resource)) `onException`
-            destroyResource pool local resource
-  putResource local resource
-  return ret
+withResource ::Pool a -> (a -> IO b) -> IO (Either SomeException b)
+withResource pool act = do
+  res <- E.try $ takeResource pool
+  case res of
+      Left (e :: E.SomeException) -> do
+          hPutStrLn stderr $ "takeResource: " ++ (show e)
+          return $ Left e
+      Right (resource, local) -> do
+          ret <- E.try $ act resource
+          case ret of
+              Left (e' :: E.SomeException) -> do
+                  destroyResource pool local resource
+                  hPutStrLn stderr $ "withResource: " ++ (show e')
+                  return $ Left e'
+              Right ret' -> do
+                  putResource local resource
+                  return $ Right ret'
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE withResource #-}
 #endif
@@ -299,7 +302,7 @@ takeResource Pool{..} = do
 -- destroy function.
 destroyResource :: Pool a -> LocalPool a -> a -> IO ()
 destroyResource Pool{..} LocalPool{..} resource = do
-   destroy resource `E.catch` \(_::SomeException) -> return ()
+   destroy resource `E.catch` \(e::SomeException) -> hPutStrLn stderr $ "destroy: " ++ (show e)
    atomically (modifyTVar_ inUse (subtract 1))
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE destroyResource #-}
