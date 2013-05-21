@@ -43,7 +43,7 @@ import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
 import Control.Concurrent.STM.Stats (getSTMStats, trackNamedSTM)
 import Control.Exception (SomeException, onException)
-import Control.Monad (forM_, forever, join, liftM2, unless, when)
+import Control.Monad (forM_, forever, liftM2, unless, when)
 
 import qualified Data.Map as M
 import Data.Hashable (hash)
@@ -58,21 +58,11 @@ import qualified Control.Exception as E
 import qualified Data.Vector as V
 
 #if MIN_VERSION_monad_control(0,3,0)
-import Control.Monad.Trans.Control (MonadBaseControl, control)
 import Control.Monad.Base (liftBase)
 #else
-import Control.Monad.IO.Control (MonadControlIO, controlIO)
 import Control.Monad.IO.Class (liftIO)
 #define control controlIO
 #define liftBase liftIO
-#endif
-
-#if MIN_VERSION_base(4,3,0)
-import Control.Exception (mask)
-#else
--- Don't do any async exception protection for older GHCs.
-mask :: ((forall a. IO a -> IO a) -> IO b) -> IO b
-mask f = f id
 #endif
 
 -- | A single resource pool entry.
@@ -80,6 +70,7 @@ data Entry a = Entry {
       entry :: a
     , lastUse :: UTCTime
     -- ^ Time of last return.
+    , uses :: Int
     }
 
 -- | A single striped pool.
@@ -113,6 +104,8 @@ data Pool a = Pool {
     -- available.
     , localPools :: V.Vector (LocalPool a)
     -- ^ Per-capability resource pools.
+    , maxUses :: Int
+    -- ^ Maximum number of times a resource can be reused
     }
 
 instance Show (Pool a) where
@@ -122,7 +115,7 @@ instance Show (Pool a) where
 
 createPool :: IO a -> (a -> IO ()) -> Int -> NominalDiffTime -> Int -> IO (Pool a)
 createPool create destroy numStripes idleTime maxResources =
-  createPool' create destroy numStripes idleTime 0 maxResources
+  createPool' create destroy numStripes idleTime 0 0 maxResources
 
 createPool'
     :: IO a
@@ -143,6 +136,8 @@ createPool'
     -- ^ Amount of seconds to delay broadcasting stats.  A value of zero
     -- will turn off stats.
     -> Int
+    -- ^ Max uses per connection before it is destroyed
+    -> Int
     -- ^ Maximum number of resources to keep open per stripe.  The
     -- smallest acceptable value is 1.
     --
@@ -150,7 +145,7 @@ createPool'
     -- single stripe, even if other stripes have idle resources
     -- available.
      -> IO (Pool a)
-createPool' create destroy numStripes idleTime trackTime maxResources = do
+createPool' create destroy numStripes idleTime trackTime maxUses maxResources = do
   when (numStripes < 1) $
     modError "pool " $ "invalid stripe count " ++ show numStripes
   when (idleTime < 0.5) $
@@ -169,6 +164,7 @@ createPool' create destroy numStripes idleTime trackTime maxResources = do
           , idleTime
           , maxResources
           , localPools
+          , maxUses
           }
   when (trackTime > 0) $ do
     trackerId <- forkIO $ tracker localPools trackTime
@@ -230,7 +226,7 @@ reaper destroy idleTime pools = forever $ do
         modifyTVar_ inUse (subtract (length stale))
       return (map entry stale)
     forM_ resources $ \resource -> do
-      destroy resource `E.catch` \(_::SomeException) -> return ()
+      destroy resource `E.catch` \(e::SomeException) -> hPutStrLn stderr $ "destroy: " ++ (show e)
 
 -- | Temporarily take a resource from a 'Pool', perform an action with
 -- it, and return it to the pool afterwards.
@@ -258,7 +254,7 @@ withResource pool act = do
       Left (e :: E.SomeException) -> do
           hPutStrLn stderr $ "takeResource: " ++ (show e)
           return $ Left e
-      Right (resource, local) -> do
+      Right (resource, uses', local) -> do
           ret <- E.try $ act resource
           case ret of
               Left (e' :: E.SomeException) -> do
@@ -266,7 +262,7 @@ withResource pool act = do
                   hPutStrLn stderr $ "withResource: " ++ (show e')
                   return $ Left e'
               Right ret' -> do
-                  putResource local resource
+                  putResource local resource uses'
                   return $ Right ret'
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE withResource #-}
@@ -279,21 +275,31 @@ withResource pool act = do
 -- This function returns both a resource and the @LocalPool@ it came from so
 -- that it may either be destroyed (via 'destroyResource') or returned to the
 -- pool (via 'putResource').
-takeResource :: Pool a -> IO (a, LocalPool a)
+takeResource :: Pool a -> IO (a, Int, LocalPool a)
 takeResource Pool{..} = do
   i <- liftBase $ ((`mod` numStripes) . hash) <$> myThreadId
   let pool@LocalPool{..} = localPools V.! i
-  resource <- liftBase . join . trackNamedSTM "takeResource" $ do
+  (getResource, uses') <- trackNamedSTM "takeResource" $ do
     ents <- readTVar entries
     case ents of
-      (Entry{..}:es) -> writeTVar entries es >> return (return entry)
+      (Entry{..}:es) -> do
+          -- handle resources that haven't been reaped yet
+          writeTVar entries es
+          case maxUses > 0 && uses >= maxUses of
+              True -> do
+                  let recreate = (destroy entry `E.catch` \e -> E.throw (e :: SomeException)) >> create
+                  return (recreate `onException` atomically (modifyTVar_ inUse (subtract 1)), 0)
+              False -> do
+                let reuse = return entry
+                return (reuse, uses)
       [] -> do
+        -- when no idle resources
         used <- readTVar inUse
         when (used == maxResources) retry
         writeTVar inUse $! used + 1
-        return $
-          create `onException` atomically (modifyTVar_ inUse (subtract 1))
-  return (resource, pool)
+        return $ (create `onException` atomically (modifyTVar_ inUse (subtract 1)), 0)
+  resource <- getResource
+  return (resource, uses', pool)
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE takeResource #-}
 #endif
@@ -309,10 +315,10 @@ destroyResource Pool{..} LocalPool{..} resource = do
 #endif
 
 -- | Return a resource to the given 'LocalPool'.
-putResource :: LocalPool a -> a -> IO ()
-putResource LocalPool{..} resource = do
+putResource :: LocalPool a -> a -> Int -> IO ()
+putResource LocalPool{..} resource uses' = do
     now <- getCurrentTime
-    atomically $ modifyTVar_ entries (Entry resource now:)
+    atomically $ modifyTVar_ entries (Entry resource now (uses'+1) :)
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE putResource #-}
 #endif
