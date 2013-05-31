@@ -1,5 +1,5 @@
 name:                bump-resource-pool
-version:             0.2.1.3
+version:             0.2.1.4
 synopsis:            A high-performance striped resource pooling implementation
 description:
   A high-performance striped pooling abstraction for managing
