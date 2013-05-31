@@ -38,7 +38,8 @@ library
     stm,
     stm-stats,
     time,
-    vector >= 0.7
+    vector >= 0.7,
+    selectable
 
   if flag(developer)
     ghc-options: -Werror

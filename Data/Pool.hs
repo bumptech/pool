@@ -42,6 +42,8 @@ import Control.Applicative ((<$>))
 import Control.Concurrent (forkIO, killThread, myThreadId, threadDelay)
 import Control.Concurrent.STM
 import Control.Concurrent.STM.Stats (getSTMStats, trackNamedSTM)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Concurrent.Selectable
 import Control.Exception (SomeException, onException)
 import Control.Monad (forM_, forever, liftM2, unless, when)
 
@@ -247,23 +249,35 @@ reaper destroy idleTime pools = forever $ do
 -- destroy a pooled resource, as doing so will almost certainly cause
 -- a subsequent user (who expects the resource to be valid) to throw
 -- an exception.
-withResource ::Pool a -> (a -> IO b) -> IO (Either SomeException b)
-withResource pool act = do
+withResource ::Pool a -> Int -> (a -> IO b) -> IO (Either SomeException b)
+withResource pool timeout act = do
   res <- E.try $ takeResource pool
   case res of
       Left (e :: E.SomeException) -> do
           hPutStrLn stderr $ "takeResource: " ++ (show e)
           return $ Left e
       Right (resource, uses', local) -> do
-          ret <- E.try $ act resource
-          case ret of
-              Left (e' :: E.SomeException) -> do
-                  destroyResource pool local resource
-                  hPutStrLn stderr $ "withResource: " ++ (show e')
-                  return $ Left e'
-              Right ret' -> do
-                  putResource local resource uses'
-                  return $ Right ret'
+        q <- newEmptyMVar
+        _ <- forkIO $ do
+             ret <- E.try $ act resource
+             putMVar q ret
+
+        res <- select (Check q) (Just timeout)
+        case res of
+            NotReady -> (error "request timeout") `E.catch` (\(e :: SomeException) -> do
+                                                                destroyResource pool local resource
+
+                                                                return $ Left e)
+            Ready r -> do
+                ret' <- takeMVar r
+                case ret' of
+                    Left (e' :: E.SomeException) -> do
+                        destroyResource pool local resource
+                        hPutStrLn stderr $ "withResource: " ++ (show e')
+                        return $ Left e'
+                    Right ret' -> do
+                        putResource local resource uses'
+                        return $ Right ret'
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE withResource #-}
 #endif
@@ -308,8 +322,8 @@ takeResource Pool{..} = do
 -- destroy function.
 destroyResource :: Pool a -> LocalPool a -> a -> IO ()
 destroyResource Pool{..} LocalPool{..} resource = do
-   destroy resource `E.catch` \(e::SomeException) -> hPutStrLn stderr $ "destroy: " ++ (show e)
    atomically (modifyTVar_ inUse (subtract 1))
+   destroy resource `E.catch` \(e::SomeException) -> hPutStrLn stderr $ "destroy: " ++ (show e)
 #if __GLASGOW_HASKELL__ >= 700
 {-# INLINABLE destroyResource #-}
 #endif
